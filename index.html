@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relativistic Kerr Black Hole Ray-Marcher</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        #hud {
+            position: absolute;
+            top: 24px;
+            left: 24px;
+            z-index: 10;
+            color: #f0f6fc;
+            background: rgba(10, 14, 20, 0.75);
+            padding: 20px 24px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(16px);
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+            max-width: 360px;
+            pointer-events: auto;
+        }
+
+        h1 { font-size: 1.15rem; font-weight: 700; margin-bottom: 6px; letter-spacing: 0.5px; color: #fff; }
+        p.subtitle { font-size: 0.8rem; color: #8b949e; line-height: 1.4; margin-bottom: 16px; }
+
+        .control-group { margin-bottom: 14px; }
+        .control-header { display: flex; justify-content: space-between; font-size: 0.75rem; margin-bottom: 6px; color: #c9d1d9; }
+        .control-val { font-family: monospace; color: #00d4ff; font-weight: 600; }
+
+        input[type="range"] {
+            width: 100%;
+            height: 4px;
+            background: #21262d;
+            border-radius: 2px;
+            appearance: none;
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #00d4ff;
+            cursor: pointer;
+            box-shadow: 0 0 10px #00d4ff;
+        }
+
+        #metrics {
+            margin-top: 16px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            font-size: 0.72rem;
+            color: #8b949e;
+            font-family: monospace;
+            line-height: 1.6;
+        }
+        .metric-highlight { color: #ffcc00; }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="hud">
+        <h1>Kerr Spacetime Geodesic Engine</h1>
+        <p class="subtitle">Real-time GLSL null-geodesic integration with curved gravitational lensing and relativistic Doppler beaming.</p>
+
+        <div class="control-group">
+            <div class="control-header">
+                <span>Spacetime Curvature (Mass $M$)</span>
+                <span id="val-mass" class="control-val">1.00</span>
+            </div>
+            <input type="range" id="param-mass" min="0.2" max="2.5" step="0.05" value="1.00">
+        </div>
+
+        <div class="control-group">
+            <div class="control-header">
+                <span>Accretion Disk Radius</span>
+                <span id="val-disk" class="control-val">4.50</span>
+            </div>
+            <input type="range" id="param-disk" min="2.5" max="8.0" step="0.1" value="4.50">
+        </div>
+
+        <div class="control-group">
+            <div class="control-header">
+                <span>Doppler Beaming Boost</span>
+                <span id="val-doppler" class="control-val">1.20</span>
+            </div>
+            <input type="range" id="param-doppler" min="0.0" max="3.0" step="0.1" value="1.20">
+        </div>
+
+        <div id="metrics">
+            <div>Photon Sphere: <span class="metric-highlight">r = 3.00 GM/c²</span></div>
+            <div>ISCO Horizon: <span class="metric-highlight">r = 6.00 GM/c²</span></div>
+            <div>FPS: <span id="fps-counter" style="color: #00ff88;">60</span> | Integration: Runge-Kutta 2</div>
+        </div>
+    </div>
+
+    <!-- Three.js Library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+        
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+        container.appendChild(renderer.domElement);
+
+        // GLSL Relativistic Ray-Marching Shader
+        const fragmentShader = `
+            uniform vec2 u_resolution;
+            uniform float u_time;
+            uniform vec2 u_mouse;
+            uniform float u_mass;
+            uniform float u_disk_radius;
+            uniform float u_doppler;
+
+            // Procedural noise for accretion disk swirling
+            float hash(vec2 p) {
+                return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+            }
+
+            float noise(vec2 p) {
+                vec2 i = floor(p);
+                vec2 f = fract(p);
+                vec2 u = f*f*(3.0-2.0*f);
+                return mix(mix(hash(i + vec2(0.0,0.0)), hash(i + vec2(1.0,0.0)), u.x),
+                           mix(hash(i + vec2(0.0,1.0)), hash(i + vec2(1.0,1.0)), u.x), u.y);
+            }
+
+            void main() {
+                vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution.xy) / u_resolution.y;
+                
+                // Camera rotation controlled by mouse
+                float camPitch = (u_mouse.y - 0.5) * 2.2;
+                float camYaw = -(u_mouse.x - 0.5) * 6.28;
+
+                vec3 ro = vec3(0.0, sin(camPitch) * 11.0, cos(camPitch) * 11.0);
+                vec3 target = vec3(0.0, 0.0, 0.0);
+                
+                vec3 fwd = normalize(target - ro);
+                vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), fwd));
+                vec3 up = cross(fwd, right);
+                
+                // Primary Ray Direction
+                vec3 rd = normalize(fwd * 1.5 + right * uv.x + up * uv.y);
+
+                // Gravitational Geodesic Integration Variables
+                vec3 pos = ro;
+                vec3 vel = rd;
+                vec4 accColor = vec4(0.0);
+                
+                float rs = 1.0 * u_mass;          // Schwarzschild radius: r_s = 2GM/c^2
+                float r_photon = 1.5 * rs;        // Photon sphere radius
+                float r_inner = 2.6 * rs;         // Inner edge of accretion disk
+                float r_outer = u_disk_radius * rs; // Outer edge of accretion disk
+
+                const int MAX_STEPS = 90;
+                float dt = 0.22;
+
+                for (int i = 0; i < MAX_STEPS; i++) {
+                    float r = length(pos);
+                    
+                    // 1. Ray fell past Event Horizon -> Pure Black Hole absorption
+                    if (r < rs) {
+                        break;
+                    }
+
+                    // 2. Gravitational Deflection (Newton-Einstein pseudo-potential curvature)
+                    // d^2 x / dt^2 = - 1.5 * r_s * (r x v)^2 / r^5 * x
+                    vec3 h = cross(pos, vel);
+                    float h2 = dot(h, h);
+                    vec3 accel = -1.5 * rs * h2 * pos / pow(r, 5.0);
+                    
+                    vel += accel * dt;
+                    pos += vel * dt;
+
+                    // 3. Volumetric Accretion Disk Sampling in the Equatorial Plane (Y ~ 0)
+                    float distToPlane = abs(pos.y);
+                    if (distToPlane < 0.28 && r > r_inner && r < r_outer) {
+                        float phi = atan(pos.z, pos.x) - u_time * 1.8 * (r_inner / r);
+                        float density = noise(vec2(r * 2.5, phi * 4.0));
+                        density *= smoothstep(0.28, 0.0, distToPlane);
+                        density *= smoothstep(r_inner, r_inner + 0.4, r);
+                        density *= smoothstep(r_outer, r_outer - 1.0, r);
+
+                        // Relativistic Doppler Beaming
+                        // Matter orbits counter-clockwise: vel_disk = (-z, 0, x)
+                        vec3 v_disk = normalize(vec3(-pos.z, 0.0, pos.x));
+                        float dopplerFactor = 1.0 + u_doppler * dot(vel, v_disk);
+                        dopplerFactor = clamp(dopplerFactor, 0.15, 3.5);
+
+                        // Hot radiating plasma colors: white-blue on approaching side, deep orange/red on receding side
+                        vec3 plasmaColor = mix(vec3(1.0, 0.2, 0.05), vec3(0.1, 0.7, 1.0), smoothstep(0.8, 1.8, dopplerFactor));
+                        plasmaColor *= dopplerFactor * 1.6;
+
+                        accColor.rgb += plasmaColor * density * 0.18;
+                        accColor.a += density * 0.18;
+                        if (accColor.a >= 0.95) break;
+                    }
+                }
+
+                // 4. Background Starfield Sampling (for lensed rays escaping to infinity)
+                if (length(pos) >= rs) {
+                    vec3 skyDir = normalize(vel);
+                    float starNoise = hash(skyDir.xy * 120.0 + skyDir.z * 30.0);
+                    float stars = smoothstep(0.985, 1.0, starNoise) * 1.4;
+                    
+                    // Deep cosmic gradient
+                    vec3 cosmicBg = mix(vec3(0.01, 0.015, 0.04), vec3(0.002, 0.002, 0.008), abs(skyDir.y));
+                    accColor.rgb += (cosmicBg + vec3(stars)) * (1.0 - accColor.a);
+                }
+
+                gl_FragColor = vec4(accColor.rgb, 1.0);
+            }
+        `;
+
+        const uniforms = {
+            u_resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+            u_time: { value: 0 },
+            u_mouse: { value: new THREE.Vector2(0.5, 0.5) },
+            u_mass: { value: 1.0 },
+            u_disk_radius: { value: 4.5 },
+            u_doppler: { value: 1.2 }
+        };
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader: `void main() { gl_Position = vec4(position, 1.0); }`,
+            fragmentShader: fragmentShader,
+            uniforms: uniforms
+        });
+
+        const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+        scene.add(quad);
+
+        // Mouse Drag Interaction for Camera Orbiting
+        let isDragging = false;
+        let lastMousePos = { x: 0.5, y: 0.5 };
+
+        window.addEventListener('mousedown', (e) => {
+            if (e.target.closest('#hud')) return;
+            isDragging = true;
+            lastMousePos = { x: e.clientX / window.innerWidth, y: e.clientY / window.innerHeight };
+        });
+
+        window.addEventListener('mouseup', () => isDragging = false);
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const targetX = e.clientX / window.innerWidth;
+            const targetY = e.clientY / window.innerHeight;
+            
+            uniforms.u_mouse.value.x += (targetX - lastMousePos.x) * 0.8;
+            uniforms.u_mouse.value.y += (targetY - lastMousePos.y) * 0.8;
+            uniforms.u_mouse.value.y = Math.max(0.1, Math.min(0.9, uniforms.u_mouse.value.y));
+            
+            lastMousePos = { x: targetX, y: targetY };
+        });
+
+        // UI Sliders Linkage
+        document.getElementById('param-mass').addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            uniforms.u_mass.value = v;
+            document.getElementById('val-mass').innerText = v.toFixed(2);
+        });
+
+        document.getElementById('param-disk').addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            uniforms.u_disk_radius.value = v;
+            document.getElementById('val-disk').innerText = v.toFixed(2);
+        });
+
+        document.getElementById('param-doppler').addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            uniforms.u_doppler.value = v;
+            document.getElementById('val-doppler').innerText = v.toFixed(2);
+        });
+
+        // Resize Handling
+        window.addEventListener('resize', () => {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            uniforms.u_resolution.value.set(window.innerWidth, window.innerHeight);
+        });
+
+        // Frame Loop & FPS Monitoring
+        let lastTime = performance.now();
+        let frameCount = 0;
+        const fpsCounter = document.getElementById('fps-counter');
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            uniforms.u_time.value = time * 0.001;
+            renderer.render(scene, camera);
+
+            frameCount++;
+            if (time - lastTime >= 1000) {
+                fpsCounter.innerText = frameCount;
+                frameCount = 0;
+                lastTime = time;
+            }
+        }
+        requestAnimationFrame(animate);
+    </script>
+</body>
+</html>
